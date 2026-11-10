@@ -12,12 +12,15 @@ import inspect
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+import httpx
 
 from cerberus.config import RunConfig
 from cerberus.contracts import Challenge, SubmissionResult
@@ -66,6 +69,7 @@ class RunStats:
     rejected: int = 0
     unknown_submissions: int = 0
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     paused_tasks: list[str] = field(default_factory=list)
 
 
@@ -185,6 +189,7 @@ class AgentRun:
         self.budget = BudgetGate(config, self.stats, checkpoint, self._config_hash, previous=previous,
             hosted_max_turns=getattr(getattr(platform, "task", None), "max_turns", None))
         self._task_sem = asyncio.Semaphore(config.concurrency.tasks)
+        self._refresh_retry_at = 0.0
 
     async def close(self) -> None:
         self.memory.close()
@@ -206,9 +211,10 @@ class AgentRun:
             config_snapshot = self.work_dir / "config.json"
             config_snapshot.write_text(json.dumps({"version": 1, "config": self.config.redacted(),
                 "config_hash": self._config_hash}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            refresh = getattr(self.platform, "refresh_progress", None)
-            tasks: list[Challenge] = await _maybe_await(
-                refresh() if refresh is not None else self.platform.discover_tasks())
+            # The hosted brief is the assigned task snapshot. Start work from
+            # it without requiring a platform round trip before the first
+            # model call; later refreshes reconcile newly unlocked questions.
+            tasks = await _maybe_await(self.platform.discover_tasks()) if self.hosted else await self._refresh_progress()
             self._reconcile_progress(tasks)
             await self._flush_queued(tasks)
             if self.config.mode in ("ctfy-competition", "tsecbench"):
@@ -225,8 +231,7 @@ class AgentRun:
                 if self.hosted and len(tasks) != 1:
                     raise ValueError("ctfy-hosted must expose exactly one assigned task")
                 await asyncio.gather(*(self._guarded_task(task) for task in tasks if task.available))
-            latest = await _maybe_await(
-                refresh() if refresh is not None else self.platform.discover_tasks())
+            latest = await self._refresh_progress()
             self._reconcile_progress(latest)
             await self._flush_queued(latest)
             if self.stats.paused_tasks:
@@ -253,6 +258,28 @@ class AgentRun:
                        tool_calls_made=self.stats.tool_calls - tool_calls,
                        stop_reason=stop_reason,
                        unsubmitted_answers=self._unsubmitted_answers())
+
+    async def _refresh_progress(self) -> list[Challenge]:
+        """Keep a hosted run alive when a read-only platform refresh times out."""
+        refresh = getattr(self.platform, "refresh_progress", None)
+        if refresh is None:
+            return await _maybe_await(self.platform.discover_tasks())
+        if self.hosted and time.monotonic() < self._refresh_retry_at:
+            return await _maybe_await(self.platform.discover_tasks())
+        try:
+            tasks = await _maybe_await(refresh())
+            self._refresh_retry_at = 0.0
+            return tasks
+        except httpx.RequestError as exc:
+            if not self.hosted:
+                raise
+            self._refresh_retry_at = time.monotonic() + 30.0
+            warning = f"hosted progress refresh {type(exc).__name__}; using assigned task snapshot"
+            if warning not in self.stats.warnings:
+                self.stats.warnings.append(warning)
+                print(warning, file=sys.stderr, flush=True)
+                await self.budget.persist_stats()
+            return await _maybe_await(self.platform.discover_tasks())
 
     def _reconcile_progress(self, tasks: list[Challenge]) -> None:
         """Use platform progress as a verdict, keeping uncertain sends distinct."""
@@ -297,7 +324,7 @@ class AgentRun:
                 acquired_instance = True
                 latest = await _maybe_await(self.platform.discover_tasks())
                 task = next((x for x in latest if x.task_id == task.task_id), task)
-            elif ensure is not None and task.target.get("instance_id") is not None:
+            elif ensure is not None and not self.hosted and task.target.get("instance_id") is not None:
                 await _maybe_await(ensure(task.task_id))
             await self._solve_task(task)
         except CompetitionSessionPaused:
@@ -365,7 +392,7 @@ class AgentRun:
                 messages.append(tool_result_message(call.id, outcome))
             refresh = getattr(self.platform, "refresh_progress", None)
             if refresh is not None:
-                latest = await _maybe_await(refresh())
+                latest = await self._refresh_progress()
                 self._reconcile_progress(latest)
                 refreshed = next((x for x in latest if x.task_id == task.task_id), task)
                 if refreshed.instance_epoch != task.instance_epoch:
@@ -442,7 +469,7 @@ class AgentRun:
                 if self.config.mode in ("ctfy-hosted", "ctfy-competition"):
                     refresh = getattr(self.platform, "refresh_progress", None)
                     if refresh is not None:
-                        latest = await _maybe_await(refresh())
+                        latest = await self._refresh_progress()
                         current = next((item for item in latest if item.task_id == task.task_id), None)
                         if current is None or current.instance_epoch != task.instance_epoch:
                             return json.dumps({"error": "instance generation changed"}), last_evidence

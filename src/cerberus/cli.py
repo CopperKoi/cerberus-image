@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import typer
@@ -75,6 +76,27 @@ def _provider(config: RunConfig):
                               max_concurrency=config.concurrency.model_requests)
 
 
+def _write_hosted_startup_failure(work_dir: Path, platform: object | None) -> None:
+    """Record a failed launch even when the agent controller never started."""
+    if platform is not None:
+        platform.export_result(stop_reason="error")
+        return
+    result = {"schema_version": 3, "solved": [], "fully_solved": False,
+              "turns": 0, "tool_calls_made": 0, "input_tokens": 0,
+              "output_tokens": 0, "stop_reason": "error"}
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=work_dir,
+                                     prefix=".result-", delete=False) as output:
+        temporary = Path(output.name)
+        json.dump(result, output, ensure_ascii=False)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    try:
+        os.replace(temporary, work_dir / "result.json")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 @app.command()
 def doctor(config: Path = typer.Option(Path("configs/mock.yaml"), exists=True),
            mode: str | None = typer.Option(None), work_dir: Path | None = typer.Option(None),
@@ -126,17 +148,32 @@ def run(config: Path = typer.Option(Path("configs/mock.yaml"), exists=True),
         return
     if selected.mode != "mock" and selected.provider.kind == "mock":
         raise ValueError("mock provider is only allowed in mock mode")
-    platform = _platform(selected)
-    provider = _provider(selected)
-    async def execute():
-        agent = AgentRun(selected, platform, provider)
-        try:
-            stats = await agent.run()
-            return stats
-        finally:
-            await agent.close()
-    stats = asyncio.run(execute())
-    typer.echo(json.dumps(stats.__dict__, ensure_ascii=False))
+    platform = None
+    run_started = False
+    try:
+        platform = _platform(selected)
+        provider = _provider(selected)
+
+        async def execute():
+            nonlocal run_started
+            agent = AgentRun(selected, platform, provider)
+            try:
+                run_started = True
+                return await agent.run()
+            finally:
+                await agent.close()
+
+        stats = asyncio.run(execute())
+        typer.echo(json.dumps(stats.__dict__, ensure_ascii=False))
+    except Exception as exc:
+        if selected.mode == "ctfy-hosted" and not run_started:
+            hosted_work = Path(os.environ.get("CTFY_WORK_DIR", selected.work_dir)).resolve()
+            try:
+                _write_hosted_startup_failure(hosted_work, platform)
+            except Exception as write_error:
+                typer.echo(f"hosted result write failed: {write_error}", err=True)
+        typer.echo(f"run failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @app.command()
