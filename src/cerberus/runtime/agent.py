@@ -381,7 +381,7 @@ class AgentRun:
         return (task.target.get("container_status") in {"available", "pending", "stop_pending"}
                 or task.target.get("instance_status") in {"ready", "starting"})
 
-    async def _acquire_managed_instance(self, task_id: str) -> None:
+    async def _acquire_managed_instance(self, task_id: str) -> dict[str, Any] | None:
         ensure = self.platform.ensure_instance
         release = getattr(self.platform, "release_instance", None)
         limits = getattr(self.platform, "get_run_limits", None)
@@ -431,9 +431,10 @@ class AgentRun:
                         pass
                 # Revalidate even a retained lease. The adapter reads remote
                 # state and avoids a duplicate start when it is still ready.
-                await _maybe_await(ensure(task_id))
+                started = await _maybe_await(ensure(task_id))
                 self._held_instances.add(task_id)
                 self._instance_last_used[task_id] = time.monotonic()
+                return started if isinstance(started, dict) else None
             except BaseException as exc:
                 # A start request may time out after the platform created the
                 # instance. A read-only reconciliation keeps it in our cleanup
@@ -498,10 +499,21 @@ class AgentRun:
         revisit = False
         try:
             if ensure is not None and managed_instance:
-                await self._acquire_managed_instance(task.task_id)
+                started = await self._acquire_managed_instance(task.task_id)
                 acquired_instance = True
                 latest = await self._refresh_progress()
                 task = next((x for x in latest if x.task_id == task.task_id), task)
+                if self.config.mode == "tsecbench" and started is not None:
+                    # The start response can contain a ready address before a
+                    # subsequent list read catches up. It is authoritative for
+                    # this one worker dispatch only; the next pass rechecks.
+                    addresses = started.get("container_addr")
+                    if (isinstance(addresses, list) and addresses
+                            and all(isinstance(address, str) for address in addresses)
+                            and not task.target.get("addresses")):
+                        task = task.model_copy(deep=True)
+                        task.target["addresses"] = addresses
+                        task.target["container_status"] = "available"
             elif ensure is not None and not self.hosted and task.target.get("instance_id") is not None:
                 await _maybe_await(ensure(task.task_id))
             revisit = await self._solve_task(task)
