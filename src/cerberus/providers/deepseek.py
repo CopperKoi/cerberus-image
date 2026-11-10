@@ -26,6 +26,10 @@ class ProviderError(RuntimeError):
     """An upstream model request failed."""
 
 
+class ProviderTransportError(ProviderError):
+    """The model transport failed before a complete turn was returned."""
+
+
 class ProviderProtocolError(ProviderError):
     """The model gateway returned an invalid or incomplete response."""
 
@@ -293,8 +297,9 @@ class DeepSeekChatClient:
                     retry_after = response.headers.get("Retry-After")
             except httpx.RequestError as exc:
                 # A transport exception might occur after the gateway accepted
-                # work. The controller decides whether another request is safe.
-                raise ProviderError(f"model transport interrupted: {type(exc).__name__}") from exc
+                # work. The controller accounts for each attempted request
+                # before deciding whether another turn can be requested.
+                raise ProviderTransportError(f"model transport interrupted: {type(exc).__name__}") from exc
             if status in {401, 403}:
                 raise ProviderAuthError(status, _safe_error(body))
             if status not in {429, 500, 502, 503, 504} or attempt >= self._max_retries:

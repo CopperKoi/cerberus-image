@@ -1,13 +1,13 @@
 schema_version: 1
 contract_version: TSecBench-Challenges/1
 mode: tsecbench
-corpus_version: v1
+corpus_version: v1.0.0
 instance_limit: 3
 work_dir: ../work/tsecbench-v1
 provider:
   kind: deepseek
 budget:
-  wall_seconds: 7200
+  wall_seconds: 21600
   total_tokens: 240000
   max_model_calls: 200
   max_tool_calls: 400

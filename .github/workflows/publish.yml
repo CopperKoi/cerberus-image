@@ -23,5 +23,5 @@ jobs:
           file: docker/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/copperkoi/cerberus-image:timeout-recovery-20261110-r3
+          tags: ghcr.io/copperkoi/cerberus-image:sapper-adoption-20261111-r6
           labels: org.opencontainers.image.source=https://github.com/CopperKoi/cerberus-image

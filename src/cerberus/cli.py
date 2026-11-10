@@ -152,6 +152,11 @@ def run(config: Path = typer.Option(Path("configs/mock.yaml"), exists=True),
     run_started = False
     try:
         platform = _platform(selected)
+        if selected.mode == "ctfy-hosted":
+            # Leave a valid rollup on disk before the first model or platform
+            # request. A hosted runner can terminate the process abruptly at
+            # its wall limit, bypassing Python's finally blocks.
+            platform.export_result(stop_reason="interrupted")
         provider = _provider(selected)
 
         async def execute():

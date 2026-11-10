@@ -5,6 +5,13 @@ if [ "$#" -gt 0 ]; then
     exec /opt/cerberus/.venv/bin/python -m cerberus.cli "$@"
 fi
 
+if [ -z "${CERBERUS_MODE:-}" ] && {
+    [ -n "${BENCHMARK_TOKEN:-}" ] || [ -n "${BENCHMARK_BASE_URL:-}" ];
+}; then
+    echo "TSecBench requires CERBERUS_MODE=tsecbench-v1 or tsecbench-v2" >&2
+    exit 2
+fi
+
 case "${CERBERUS_MODE:-ctfy-hosted}" in
     ctfy-hosted)
         config=/opt/cerberus/configs/ctfy-hosted.yaml

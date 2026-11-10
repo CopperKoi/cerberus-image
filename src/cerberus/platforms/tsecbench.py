@@ -59,6 +59,7 @@ class TSecBenchAdapter:
         self._last_instances: dict[str, tuple[str, tuple[str, ...]]] = {}
         self._instance_epochs: dict[str, int] = {}
         self._confirmed_indices: dict[str, set[int]] = {}
+        self._submitted_answers: set[tuple[str, str]] = set()
 
     async def close(self) -> None:
         if self._own_client:
@@ -73,8 +74,12 @@ class TSecBenchAdapter:
                     headers={"BENCHMARK_TOKEN": self.token},
                 )
             except (httpx.TimeoutException, httpx.TransportError):
-                # Mutations may already have succeeded remotely. The controller must reconcile.
-                raise
+                # Read-only calls can be retried; a mutation may already have
+                # succeeded remotely and must be reconciled by the controller.
+                if method != "GET" or attempt >= retries:
+                    raise
+                await asyncio.sleep(min(8.0, 0.5 * 2**attempt))
+                continue
             if response.status_code in (429, 502, 503, 504) and method == "GET" and attempt < retries:
                 raw_wait = response.headers.get("Retry-After", "")
                 try:
@@ -105,6 +110,11 @@ class TSecBenchAdapter:
 
     async def discover_tasks(self) -> list[Challenge]:
         rows = await self._request("list", "GET", "/openapi/v1/challenges")
+        # The documented API returns an array. Sapper v2's arena client also
+        # accepts a ``{"challenges": [...]}`` envelope observed in compatible
+        # deployments; retain strict entry validation below.
+        if isinstance(rows, dict) and isinstance(rows.get("challenges"), list):
+            rows = rows["challenges"]
         if not isinstance(rows, list):
             raise ValueError("TSecBench list response must be an array")
         challenges: list[Challenge] = []
@@ -205,14 +215,20 @@ class TSecBenchAdapter:
     async def submit_answer(self, task_id: str, question_id: str, answer: str) -> SubmissionResult:
         if not (1 <= len(answer) <= 4096):
             raise ValueError("flag length must be 1..4096")
+        identity = (task_id, answer)
+        if identity in self._submitted_answers:
+            return SubmissionResult(task_id=task_id, question_id=question_id,
+                                    status="duplicate", raw={"code": "already_submitted_locally"})
         try:
             body = await self._request("submit", "POST", "/openapi/v1/challenges/submit",
                                        json_body={"unique_code": task_id, "flag": answer})
         except TSecError as exc:
             if exc.code == "duplicate":
+                self._submitted_answers.add(identity)
                 return SubmissionResult(task_id=task_id, question_id=question_id, status="duplicate",
                                         raw={"code": "duplicate", "message": exc.message})
             raise
+        self._submitted_answers.add(identity)
         if not isinstance(body, dict) or type(body.get("correct")) is not bool:
             raise ValueError("invalid TSecBench submission response")
         matched = body.get("matched_flag_index")

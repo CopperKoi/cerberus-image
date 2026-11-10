@@ -17,6 +17,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 from cerberus.contracts import Challenge, PlatformLimits
 
 
@@ -26,8 +28,10 @@ class SchedulePolicy:
     local_instance_limit: int = 1
     max_cycles: int = 20
     max_revisits_per_projection: int = 1
+    max_total_dispatches_per_task: int = 0
     idle_poll_s: float = 0.0
     max_idle_cycles: int = 0
+    wait_until_closing: bool = False
     age_weight_per_s: float = 0.001
     progress_weight: float = 2.0
     point_weight: float = 1.0
@@ -36,8 +40,11 @@ class SchedulePolicy:
     def __post_init__(self) -> None:
         if min(self.max_tasks, self.local_instance_limit, self.max_cycles) < 1:
             raise ValueError("task, instance and cycle limits must be positive")
-        if self.max_revisits_per_projection < 0 or self.max_idle_cycles < 0:
+        if (self.max_revisits_per_projection < 0 or self.max_idle_cycles < 0
+                or self.max_total_dispatches_per_task < 0):
             raise ValueError("revisit limit must be nonnegative")
+        if self.wait_until_closing and self.idle_poll_s <= 0:
+            raise ValueError("waiting for new tasks requires a positive idle poll interval")
         weights = (self.age_weight_per_s, self.progress_weight, self.point_weight,
                    self.cost_weight, self.idle_poll_s)
         if any(not math.isfinite(x) or x < 0 for x in weights):
@@ -153,6 +160,7 @@ class ContestScheduler:
         self._seen_at: dict[str, float] = {}
         self._costs: dict[str, float] = {}
         self._attempts: dict[tuple[str, tuple[Any, ...]], int] = {}
+        self._total_dispatches: dict[str, int] = {}
         self._paused_until: dict[str, float] = {}
         self._last_projection: dict[str, tuple[Any, ...]] = {}
 
@@ -182,7 +190,8 @@ class ContestScheduler:
         closing: Callable[[], bool] = lambda: False,
     ) -> list[DispatchRecord]:
         idle_cycles = 0
-        for cycle in range(self.policy.max_cycles):
+        cycle = 0
+        while cycle < self.policy.max_cycles:
             if closing():
                 break
             tasks = await _await(discover())
@@ -198,22 +207,50 @@ class ContestScheduler:
                     await self.instances.set_limit(min(self.policy.local_instance_limit, limits.max_instances))
             eligible = [task for task in tasks if self._eligible(task)]
             if not eligible:
-                if (idle_cycles >= self.policy.max_idle_cycles or self.policy.idle_poll_s <= 0):
+                # A temporary worker failure may carry Retry-After longer than
+                # the ordinary idle observation window. Keep its bounded retry
+                # alive instead of exiting while that task is cooling down.
+                retry_at = min((self._paused_until[task.task_id] for task in tasks
+                                if _feasible(task)
+                                and self._attempts.get((task.task_id, _projection(task)), 0)
+                                <= self.policy.max_revisits_per_projection
+                                and self._paused_until.get(task.task_id, 0.0) > self.now()),
+                               default=None)
+                waiting_for_retry = retry_at is not None
+                if (not self.policy.wait_until_closing and not waiting_for_retry
+                        and (idle_cycles >= self.policy.max_idle_cycles or self.policy.idle_poll_s <= 0)):
                     break
-                idle_cycles += 1
                 platform_wait = (limits.poll_after_s or 0.0) if limits is not None else 0.0
-                await asyncio.sleep(max(self.policy.idle_poll_s, platform_wait))
+                sleep_s = max(self.policy.idle_poll_s, platform_wait)
+                if waiting_for_retry:
+                    # Recheck the closing gate while honoring a platform poll floor.
+                    sleep_s = max(sleep_s, min(max(0.0, retry_at - self.now()), 5.0))
+                else:
+                    idle_cycles += 1
+                await asyncio.sleep(sleep_s)
+                if not self.policy.wait_until_closing and not waiting_for_retry:
+                    cycle += 1
                 continue
             idle_cycles = 0
-            eligible.sort(key=lambda task: (-self.priority(task), task.task_id))
+            # Give each task one exploration pass before revisiting a task
+            # whose score rose through partial progress. This stops a small
+            # set of early tasks from consuming the entire shared budget.
+            eligible.sort(key=lambda task: (
+                self._total_dispatches.get(task.task_id, 0) > 0,
+                -self.priority(task), task.task_id))
             # Every batch is bounded by task slots. An instance permit is held
             # around the worker so its ensure/release pair cannot exceed cap.
             batch = eligible[: self.policy.max_tasks]
             await asyncio.gather(*(self._dispatch(task, cycle, work, closing) for task in batch))
+            cycle += 1
         return list(self.records)
 
     def _eligible(self, task: Challenge) -> bool:
         if not _feasible(task) or self.now() < self._paused_until.get(task.task_id, 0.0):
+            return False
+        if (self.policy.max_total_dispatches_per_task
+                and self._total_dispatches.get(task.task_id, 0)
+                >= self.policy.max_total_dispatches_per_task):
             return False
         if _requires_instance(task) and self.instances.limit == 0:
             return False
@@ -228,6 +265,7 @@ class ContestScheduler:
         projection = _projection(task)
         key = (task.task_id, projection)
         self._attempts[key] = self._attempts.get(key, 0) + 1
+        self._total_dispatches[task.task_id] = self._total_dispatches.get(task.task_id, 0) + 1
         priority = self.priority(task)
         try:
             if _requires_instance(task):
@@ -249,8 +287,23 @@ class ContestScheduler:
             result = "worked"
         except Exception as exc:
             result = f"error:{type(exc).__name__}"
-            self._attempts[key] = self.policy.max_revisits_per_projection + 1
+            if _retryable_worker_error(exc):
+                retry_after = getattr(exc, "retry_after_s", None)
+                if isinstance(retry_after, (int, float)) and math.isfinite(retry_after) and retry_after > 0:
+                    self._paused_until[task.task_id] = self.now() + retry_after
+            else:
+                self._attempts[key] = self.policy.max_revisits_per_projection + 1
         prior = self._last_projection.get(task.task_id)
         self._last_projection[task.task_id] = projection
         self.records.append(DispatchRecord(task.task_id, task.instance_epoch, cycle, priority,
                                            result, prior is not None and prior != projection))
+
+
+def _retryable_worker_error(exc: Exception) -> bool:
+    """Retry transport and temporary platform failures without replaying other errors."""
+    if isinstance(exc, httpx.RequestError):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status in {429, 500, 502, 503, 504}:
+        return True
+    return status == 409 and getattr(exc, "code", None) == "resource_unavailable"
