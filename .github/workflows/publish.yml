@@ -23,5 +23,5 @@ jobs:
           file: docker/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/copperkoi/cerberus-image:smoke-20261110-r1
+          tags: ghcr.io/copperkoi/cerberus-image:protocol-fix-20261110-r2
           labels: org.opencontainers.image.source=https://github.com/CopperKoi/cerberus-image

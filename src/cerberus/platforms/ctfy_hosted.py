@@ -70,8 +70,10 @@ class HostedTask:
         result_contract = data.get("result")
         if isinstance(result_contract, dict) and result_contract.get("path") not in (None, str(work / "result.json")):
             raise HostedContractError("result.path conflicts with CTFY-0001 v3 work directory")
+        env = environ if environ is not None else os.environ
         challenge = data.get("challenge")
-        if not isinstance(challenge, dict) or not isinstance(challenge.get("id"), str) or not challenge["id"]:
+        if (not isinstance(challenge, dict) or not isinstance(challenge.get("id"), str)
+                or (not challenge["id"] and not data.get("dry_run") and env.get("CTFY_EVAL_DRY_RUN") != "1")):
             raise HostedContractError("task.json.challenge.id is required")
         mode = data.get("run_mode")
         if mode not in {"instance", "qa", "defence", "awd", "engagement"}:
@@ -79,7 +81,6 @@ class HostedTask:
         target_instance = data.get("target_instance")
         if target_instance is not None and (not isinstance(target_instance, str) or not target_instance):
             raise HostedContractError("target_instance must be a nonempty string or null")
-        env = environ if environ is not None else os.environ
         dry_run = bool(data.get("dry_run")) or env.get("CTFY_EVAL_DRY_RUN") == "1"
         flavor = env.get("LLM_FLAVOR")
         if not dry_run and flavor is not None and flavor != "openai":
