@@ -202,6 +202,14 @@ class AgentRun:
         self._refresh_retry_at = 0.0
         self._task_histories: dict[str, tuple[int, list[dict[str, Any]]]] = {}
         self._hosted_round_start: tuple[int, int, int, int] | None = None
+        # Remote instances outlive a worker quantum. The scheduler's slot pool
+        # bounds concurrent workers, while this pool bounds live remote leases.
+        self._instance_condition = asyncio.Condition()
+        self._working_instances: set[str] = set()
+        self._held_instances: set[str] = set()
+        self._instance_last_used: dict[str, float] = {}
+        self._instance_release_pending: dict[str, float] = {}
+        self._preserve_remote_instances: set[str] = set()
 
     def _export_hosted_result(self, stop_reason: str) -> None:
         if not self.hosted or self._hosted_round_start is None:
@@ -218,6 +226,7 @@ class AgentRun:
                unsubmitted_answers=self._unsubmitted_answers())
 
     async def close(self) -> None:
+        await self._cleanup_managed_instances()
         self.memory.close()
         self.ledger.close()
         if self.provider is not None:
@@ -294,6 +303,7 @@ class AgentRun:
             stop_reason = "error"
             raise
         finally:
+            await self._cleanup_managed_instances()
             await self.budget.persist_stats()
             if self.hosted:
                 self._export_hosted_result(stop_reason)
@@ -366,6 +376,115 @@ class AgentRun:
                 await self.budget.persist_stats()
                 return WorkOutcome()
 
+    @staticmethod
+    def _remote_instance_active(task: Challenge) -> bool:
+        return (task.target.get("container_status") in {"available", "pending", "stop_pending"}
+                or task.target.get("instance_status") in {"ready", "starting"})
+
+    async def _acquire_managed_instance(self, task_id: str) -> None:
+        ensure = self.platform.ensure_instance
+        release = getattr(self.platform, "release_instance", None)
+        limits = getattr(self.platform, "get_run_limits", None)
+        async with self._instance_condition:
+            if task_id in self._working_instances:
+                raise ValueError("task already owns an active instance worker")
+            self._working_instances.add(task_id)
+            try:
+                while True:
+                    tasks = await self._refresh_progress()
+                    task_states = {item.task_id: item for item in tasks}
+                    active_remote = {item.task_id for item in tasks if self._remote_instance_active(item)}
+                    current = task_states.get(task_id)
+                    if (current is not None and task_id in self._held_instances
+                            and current.target.get("container_status") == "stopped"):
+                        self._held_instances.discard(task_id)
+                    if (current is not None and task_id in self._held_instances
+                            and current.target.get("instance_status") == "stopped"):
+                        self._held_instances.discard(task_id)
+                    cap = self.config.instance_limit or self.config.concurrency.tasks
+                    if limits is not None:
+                        platform_limits = await _maybe_await(limits())
+                        if platform_limits.max_instances is not None:
+                            cap = min(cap, platform_limits.max_instances)
+                    if cap < 1:
+                        raise ValueError("platform has no instance capacity")
+                    active = active_remote | self._held_instances
+                    for pending in list(self._instance_release_pending):
+                        if pending not in active_remote:
+                            self._instance_release_pending.pop(pending)
+                    if task_id in active or len(active) < cap:
+                        break
+                    victims = [item for item in active if item not in self._working_instances
+                               and item not in self._instance_release_pending]
+                    if victims and release is not None:
+                        victim = min(victims, key=lambda item: self._instance_last_used.get(item, 0.0))
+                        await _maybe_await(release(victim))
+                        self._held_instances.discard(victim)
+                        self._instance_release_pending[victim] = time.monotonic()
+                        continue
+                    if any(time.monotonic() - start > 30.0
+                           for start in self._instance_release_pending.values()):
+                        raise TimeoutError("released instance did not leave platform capacity")
+                    try:
+                        await asyncio.wait_for(self._instance_condition.wait(), timeout=0.5)
+                    except TimeoutError:
+                        pass
+                # Revalidate even a retained lease. The adapter reads remote
+                # state and avoids a duplicate start when it is still ready.
+                await _maybe_await(ensure(task_id))
+                self._held_instances.add(task_id)
+                self._instance_last_used[task_id] = time.monotonic()
+            except BaseException as exc:
+                # A start request may time out after the platform created the
+                # instance. A read-only reconciliation keeps it in our cleanup
+                # set without issuing another mutation here.
+                if isinstance(exc, Exception) and task_id not in self._held_instances:
+                    try:
+                        observed = await self._refresh_progress()
+                        if any(item.task_id == task_id and self._remote_instance_active(item)
+                               for item in observed):
+                            self._held_instances.add(task_id)
+                    except Exception as reconcile_error:
+                        warning = f"{task_id}: instance start reconciliation {type(reconcile_error).__name__}"
+                        if warning not in self.stats.warnings:
+                            self.stats.warnings.append(warning)
+                self._working_instances.discard(task_id)
+                self._instance_condition.notify_all()
+                raise
+
+    async def _finish_managed_instance(self, task_id: str, *, retain: bool) -> None:
+        async with self._instance_condition:
+            try:
+                if not retain and task_id in self._held_instances:
+                    release = getattr(self.platform, "release_instance", None)
+                    if release is not None:
+                        await _maybe_await(release(task_id))
+                        self._held_instances.discard(task_id)
+                        self._instance_release_pending[task_id] = time.monotonic()
+                self._instance_last_used[task_id] = time.monotonic()
+            finally:
+                self._working_instances.discard(task_id)
+                self._instance_condition.notify_all()
+
+    async def _cleanup_managed_instances(self) -> None:
+        if self.config.mode not in {"tsecbench", "ctfy-competition"}:
+            return
+        async with self._instance_condition:
+            release = getattr(self.platform, "release_instance", None)
+            if release is None:
+                return
+            for task_id in list(self._held_instances - self._working_instances
+                                - self._preserve_remote_instances):
+                try:
+                    await _maybe_await(release(task_id))
+                except Exception as exc:
+                    error = f"{task_id}: release {type(exc).__name__}"
+                    if error not in self.stats.errors:
+                        self.stats.errors.append(error)
+                else:
+                    self._held_instances.discard(task_id)
+            self._instance_condition.notify_all()
+
     async def _run_task(self, task: Challenge) -> WorkOutcome:
         if self.provider is None:
             return WorkOutcome()  # Mock dry-run exercises discovery without a paid model.
@@ -376,9 +495,10 @@ class AgentRun:
                             and task.target.get("run_mode") != "qa")
         acquired_instance = False
         paused = False
+        revisit = False
         try:
             if ensure is not None and managed_instance:
-                await _maybe_await(ensure(task.task_id))
+                await self._acquire_managed_instance(task.task_id)
                 acquired_instance = True
                 latest = await self._refresh_progress()
                 task = next((x for x in latest if x.task_id == task.task_id), task)
@@ -388,17 +508,18 @@ class AgentRun:
             return WorkOutcome(revisit=revisit)
         except CompetitionSessionPaused:
             paused = True
+            self._preserve_remote_instances.add(task.task_id)
             raise
         finally:
-            # A paused competition session retains the instance for a later
-            # authorized session. All other exits free scarce instance slots.
-            if acquired_instance and not paused:
-                release = getattr(self.platform, "release_instance", None)
-                if release is not None:
-                    try:
-                        await _maybe_await(release(task.task_id))
-                    except Exception as exc:
-                        self.stats.errors.append(f"{task.task_id}: release {type(exc).__name__}")
+            # Keep a live instance for an immediate continuation. The next
+            # task may evict it if the remote cap is full and no worker uses it.
+            if acquired_instance:
+                try:
+                    await self._finish_managed_instance(task.task_id, retain=paused or revisit)
+                except Exception as exc:
+                    error = f"{task.task_id}: release {type(exc).__name__}"
+                    if error not in self.stats.errors:
+                        self.stats.errors.append(error)
 
     async def _solve_task(self, task: Challenge) -> bool:
         prompt = self._task_prompt(task)
