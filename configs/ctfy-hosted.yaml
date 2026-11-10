@@ -1,0 +1,20 @@
+schema_version: 1
+contract_version: CTFY-0001/3
+mode: ctfy-hosted
+work_dir: /work
+provider:
+  kind: deepseek
+  base_url_env: LLM_BASE_URL
+  api_key_env: LLM_API_KEY
+  model_env: LLM_MODEL
+budget:
+  wall_seconds: 3600
+  total_tokens: 120000
+  max_model_calls: 100
+  max_tool_calls: 200
+  closing_seconds: 90
+concurrency:
+  tasks: 1
+  workers_per_task: 1
+  model_requests: 1
+  tool_processes: 1

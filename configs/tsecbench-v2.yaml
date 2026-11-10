@@ -1,0 +1,19 @@
+schema_version: 1
+contract_version: TSecBench-Challenges/1
+mode: tsecbench
+corpus_version: v2
+instance_limit: 3
+work_dir: ../work/tsecbench-v2
+provider:
+  kind: deepseek
+budget:
+  wall_seconds: 7200
+  total_tokens: 240000
+  max_model_calls: 200
+  max_tool_calls: 400
+  closing_seconds: 180
+concurrency:
+  tasks: 2
+  workers_per_task: 1
+  model_requests: 2
+  tool_processes: 2

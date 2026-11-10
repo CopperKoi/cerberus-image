@@ -1,0 +1,8 @@
+*.pyc
+__pycache__/
+.venv/
+work/
+dist/
+apikey
+ctfy.md
+ctfy_docker.md

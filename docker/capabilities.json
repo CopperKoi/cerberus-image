@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "image_flavor": "offline-general-tools",
+  "architecture": "linux/amd64",
+  "python": "3.12.12",
+  "python_tool_lock": "docker/tool-requirements.lock",
+  "offline_smoke": "docker/check_capabilities.py",
+  "domains": {
+    "web": ["curl", "httpx", "beautifulsoup4", "nmap_tcp_connect"],
+    "pwn": ["binutils", "gcc", "gdb_if_ptrace_authorized", "pwntools", "pyelftools"],
+    "reverse": ["binutils", "capstone", "unicorn", "z3-solver"],
+    "crypto": ["pycryptodome", "sympy", "z3-solver"],
+    "misc": ["file", "7z", "exiftool", "tshark", "Pillow", "scapy_offline_pcap"],
+    "ai_security": ["httpx", "json", "task_scoped_shell"]
+  },
+  "not_bundled": ["Chromium", "Playwright", "Ghidra", "SageMath", "fpylll", "OCR", "browser_automation"],
+  "runtime_limitations": ["gdb ptrace may be denied by container policy", "nmap raw socket scans are unavailable without capabilities", "packet capture is unavailable without capabilities"],
+  "platform_contracts": {
+    "ctfy-hosted": "locally_mocked_v3_platform_unverified",
+    "tsecbench": "locally_mocked_api_v1_platform_unverified",
+    "ctfy-competition": "contract_unverified"
+  }
+}

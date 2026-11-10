@@ -1,0 +1,11 @@
+schema_version: 1
+mode: mock
+work_dir: ../work/mock
+provider:
+  kind: mock
+budget:
+  wall_seconds: 120
+  total_tokens: 1000
+  max_model_calls: 10
+  max_tool_calls: 20
+  closing_seconds: 10

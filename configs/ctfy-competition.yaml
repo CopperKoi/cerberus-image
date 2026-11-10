@@ -1,0 +1,21 @@
+schema_version: 1
+mode: ctfy-competition
+competition_id: c0d8b4e3dd3b42c095d63d7dfa66431f
+work_dir: /work
+instance_limit: 3
+provider:
+  kind: deepseek
+  base_url_env: LLM_BASE_URL
+  api_key_env: LLM_API_KEY
+  model_env: LLM_MODEL
+budget:
+  wall_seconds: 36000
+  total_tokens: 500000
+  max_model_calls: 500
+  max_tool_calls: 1200
+  closing_seconds: 300
+concurrency:
+  tasks: 2
+  workers_per_task: 1
+  model_requests: 2
+  tool_processes: 2
