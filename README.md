@@ -4,6 +4,6 @@ Public build source for the cerberus CTF agent container. This is the packaged r
 
 The image uses the CTFy hosted contract by default. For TSecBench hosted runs, set `CERBERUS_MODE=tsecbench-v1` or `tsecbench-v2` and configure the DeepSeek `LLM_*` variables in the platform. The platform injects `BENCHMARK_*` variables.
 
-Current image: `ghcr.io/copperkoi/cerberus-image:recovery-continuity-20261111-r15`. Its benchmark score is tracked in the private development workspace; submit only the image reference as supported by the platform.
+Current image: `ghcr.io/copperkoi/cerberus-image:depth-budget-20261111-r16`. Its benchmark score is tracked in the private development workspace; submit only the image reference as supported by the platform.
 
 Sapper v2 by N1nEmAn (MIT license) informed interface and scheduling choices. This repository does not include Sapper source files, benchmark answers, task solutions or success traces.

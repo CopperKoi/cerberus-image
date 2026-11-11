@@ -3,14 +3,15 @@ contract_version: TSecBench-Challenges/1
 mode: tsecbench
 corpus_version: v2.0.0
 instance_limit: 3
+model_calls_per_dispatch: 6
 work_dir: ../work/tsecbench-v2
 provider:
   kind: deepseek
 budget:
   wall_seconds: 28800
-  total_tokens: 240000
-  max_model_calls: 200
-  max_tool_calls: 400
+  total_tokens: 1200000
+  max_model_calls: 600
+  max_tool_calls: 1200
   closing_seconds: 180
 concurrency:
   tasks: 2

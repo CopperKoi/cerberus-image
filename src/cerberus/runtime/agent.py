@@ -111,6 +111,7 @@ class BudgetGate:
         self.started_at_epoch = (float(previous["started_at_epoch"]) if previous is not None
                                  else time.time())
         self._tokens_reserved = int(previous["tokens_reserved"]) if previous is not None else 0
+        self._model_exhausted = bool(previous.get("model_exhausted", False)) if previous is not None else False
         self.checkpoint = checkpoint
         self.config_hash = config_hash
         self.hosted_max_turns = hosted_max_turns
@@ -121,18 +122,27 @@ class BudgetGate:
     def _persist(self) -> None:
         _atomic_json(self.checkpoint, {"schema_version": 1,
             "config_hash": self.config_hash, "started_at_epoch": self.started_at_epoch,
-            "tokens_reserved": self._tokens_reserved, "stats": asdict(self.stats)})
+            "tokens_reserved": self._tokens_reserved, "model_exhausted": self._model_exhausted,
+            "stats": asdict(self.stats)})
 
     @property
     def remaining_seconds(self) -> float:
         return self.config.budget.wall_seconds - (time.time() - self.started_at_epoch)
 
+    @property
+    def model_budget_exhausted(self) -> bool:
+        return (self._model_exhausted
+                or self.stats.model_calls >= self.config.budget.max_model_calls
+                or (self.hosted_max_turns is not None and self.stats.model_calls >= self.hosted_max_turns)
+                or self._tokens_reserved + 1024 > self.config.budget.total_tokens)
+
     async def reserve_model(self, estimated_tokens: int) -> bool:
         async with self._lock:
             if (self.remaining_seconds <= self.config.budget.closing_seconds
-                    or self.stats.model_calls >= self.config.budget.max_model_calls
-                    or (self.hosted_max_turns is not None and self.stats.model_calls >= self.hosted_max_turns)
+                    or self.model_budget_exhausted
                     or self._tokens_reserved + estimated_tokens > self.config.budget.total_tokens):
+                self._model_exhausted = True
+                self._persist()
                 return False
             self.stats.model_calls += 1
             self._tokens_reserved += estimated_tokens
@@ -288,7 +298,8 @@ class AgentRun:
                 limits = getattr(self.platform, "get_run_limits", None)
                 records = await scheduler.run(self.platform.discover_tasks, self._guarded_task,
                     get_limits=limits,
-                    closing=lambda: self.budget.remaining_seconds <= self.config.budget.closing_seconds)
+                    closing=lambda: (self.budget.remaining_seconds <= self.config.budget.closing_seconds
+                                     or self.budget.model_budget_exhausted))
                 # A temporary error that later succeeded is kept as a warning.
                 # Only the last dispatch outcome for each task is a run error.
                 latest_outcome = {record.task_id: record.result for record in records}
@@ -312,7 +323,8 @@ class AgentRun:
                 stop_reason = "paused"
             elif self.stats.errors:
                 stop_reason = "error"
-            elif self.budget.remaining_seconds <= self.config.budget.closing_seconds:
+            elif (self.budget.remaining_seconds <= self.config.budget.closing_seconds
+                  or self.budget.model_budget_exhausted):
                 stop_reason = "budget"
             return self.stats
         except asyncio.CancelledError:
@@ -612,7 +624,7 @@ class AgentRun:
         # Long contests dispatch a small quantum to each task. The scheduler
         # revisits useful work after other visible tasks have had a turn.
         multi_task = self.config.mode in ("tsecbench", "ctfy-competition")
-        quantum = 2 if multi_task else self.config.budget.max_model_calls
+        quantum = self.config.model_calls_per_dispatch if multi_task else self.config.budget.max_model_calls
         continue_work = False
         for _ in range(quantum):
             if self.budget.remaining_seconds <= self.config.budget.closing_seconds:

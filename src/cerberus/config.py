@@ -64,6 +64,7 @@ class RunConfig(BaseModel):
     competition_id: str | None = None
     allow_hints: bool = False
     instance_limit: PositiveInt | None = None
+    model_calls_per_dispatch: PositiveInt = 2
 
     @model_validator(mode="after")
     def mode_fields(self) -> RunConfig:

@@ -152,6 +152,27 @@ class ToolExecutor:
                            out_trunc or out_capture_trunc, err_trunc or err_capture_trunc,
                            out_capture_trunc, err_capture_trunc)
 
+    def read_file(self, task_id: str, relative_path: str, *, offset: int = 0, limit: int = 65536) -> bytes:
+        if offset < 0 or limit < 1 or limit > self.output_limit:
+            raise ValueError("invalid read bounds")
+        path = self._resolve(task_id, relative_path)
+        with path.open("rb") as source:
+            source.seek(offset)
+            return source.read(limit)
+
+    def write_file(self, task_id: str, relative_path: str, content: bytes) -> EvidenceRef:
+        if len(content) > self.output_limit * 4:
+            raise ValueError("file write exceeds per-call limit")
+        path = self._resolve(task_id, relative_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # O_NOFOLLOW prevents writing through a final symlink.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        return self.evidence.put_bytes(content)
+
     def stage_attachment(self, task_id: str, name: str, source: str | Path,
                          *, max_bytes: int = 100_000_000) -> EvidenceRef:
         """Copy a platform attachment into one task without trusting its filename."""
@@ -185,27 +206,6 @@ class ToolExecutor:
                     temporary.unlink(missing_ok=True)
         with destination.open("rb") as staged:
             return self.evidence.put_stream(staged)
-
-    def read_file(self, task_id: str, relative_path: str, *, offset: int = 0, limit: int = 65536) -> bytes:
-        if offset < 0 or limit < 1 or limit > self.output_limit:
-            raise ValueError("invalid read bounds")
-        path = self._resolve(task_id, relative_path)
-        with path.open("rb") as source:
-            source.seek(offset)
-            return source.read(limit)
-
-    def write_file(self, task_id: str, relative_path: str, content: bytes) -> EvidenceRef:
-        if len(content) > self.output_limit * 4:
-            raise ValueError("file write exceeds per-call limit")
-        path = self._resolve(task_id, relative_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # O_NOFOLLOW prevents writing through a final symlink.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "wb") as output:
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
-        return self.evidence.put_bytes(content)
 
     def _resolve(self, task_id: str, relative_path: str) -> Path:
         if not relative_path or Path(relative_path).is_absolute():
