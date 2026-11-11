@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
@@ -152,9 +153,13 @@ class ContestScheduler:
     this pool only prevents concurrent local requests from exceeding limits.
     """
 
-    def __init__(self, policy: SchedulePolicy, *, now: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, policy: SchedulePolicy, *, now: Callable[[], float] = time.monotonic,
+                 wall_now: Callable[[], float] = time.time,
+                 checkpoint: Callable[[dict[str, Any]], Any] | None = None) -> None:
         self.policy = policy
         self.now = now
+        self.wall_now = wall_now
+        self.checkpoint = checkpoint
         self.instances = SlotPool(policy.local_instance_limit)
         self.records: list[DispatchRecord] = []
         self._seen_at: dict[str, float] = {}
@@ -163,6 +168,97 @@ class ContestScheduler:
         self._total_dispatches: dict[str, int] = {}
         self._paused_until: dict[str, float] = {}
         self._last_projection: dict[str, tuple[Any, ...]] = {}
+        self._inflight: dict[str, tuple[Any, ...]] = {}
+        self._cycle = 0
+        self._checkpoint_lock = asyncio.Lock()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return durable scheduling decisions, excluding unfinished dispatches.
+
+        Local slot permits and remote instance leases are deliberately absent:
+        after a restart the platform adapter must reconcile live resources.
+        Pauses and task age use wall-clock elapsed time across process restarts.
+        """
+        now = self.now()
+        attempts = dict(self._attempts)
+        dispatches = dict(self._total_dispatches)
+        for task_id, projection in self._inflight.items():
+            key = (task_id, projection)
+            attempts[key] -= 1
+            if attempts[key] == 0:
+                del attempts[key]
+            dispatches[task_id] -= 1
+            if dispatches[task_id] == 0:
+                del dispatches[task_id]
+        return {
+            "schema_version": 1,
+            "policy": asdict(self.policy),
+            "saved_at_epoch": self.wall_now(),
+            "cycle": self._cycle,
+            "seen_age_s": {task_id: max(0.0, now - seen) for task_id, seen in self._seen_at.items()},
+            "costs": dict(self._costs),
+            "attempts": [[task_id, _json_projection(projection), count]
+                         for (task_id, projection), count in attempts.items()],
+            "total_dispatches": dispatches,
+            "pause_remaining_s": {task_id: max(0.0, until - now)
+                                  for task_id, until in self._paused_until.items()},
+            "last_projection": {task_id: _json_projection(projection)
+                                for task_id, projection in self._last_projection.items()},
+            "records": [asdict(record) for record in self.records],
+        }
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Restore a completed checkpoint before dispatching any new work."""
+        if self.records or self._attempts or self._inflight or self._cycle:
+            raise ValueError("scheduler state can only be restored before work starts")
+        if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:
+            raise ValueError("unsupported scheduler checkpoint")
+        if snapshot.get("policy") != asdict(self.policy):
+            raise ValueError("scheduler checkpoint policy does not match")
+        try:
+            saved_at = _finite_number(snapshot["saved_at_epoch"])
+            elapsed = max(0.0, self.wall_now() - saved_at)
+            cycle = _nonnegative_int(snapshot["cycle"])
+            seen_age = _number_map(snapshot["seen_age_s"])
+            costs = _number_map(snapshot["costs"])
+            total = _int_map(snapshot["total_dispatches"])
+            pause = _number_map(snapshot["pause_remaining_s"])
+            attempts: dict[tuple[str, tuple[Any, ...]], int] = {}
+            for item in snapshot["attempts"]:
+                task_id, raw_projection, count = item
+                if not isinstance(task_id, str):
+                    raise ValueError("invalid task ID")
+                key = (task_id, _restore_projection(raw_projection))
+                if key in attempts:
+                    raise ValueError("duplicate scheduler attempt")
+                attempts[key] = _nonnegative_int(count)
+            raw_last = snapshot["last_projection"]
+            if not isinstance(raw_last, dict) or any(not isinstance(key, str) for key in raw_last):
+                raise ValueError("invalid last projection")
+            last = {task_id: _restore_projection(projection)
+                    for task_id, projection in raw_last.items()}
+            records = [DispatchRecord(**record) for record in snapshot["records"]]
+            if any(not isinstance(record.task_id, str) or not math.isfinite(record.priority)
+                   or record.cycle < 0 for record in records):
+                raise ValueError("invalid dispatch record")
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid scheduler checkpoint") from exc
+        now = self.now()
+        self._cycle = cycle
+        self._seen_at = {task_id: now - age - elapsed for task_id, age in seen_age.items()}
+        self._costs = costs
+        self._attempts = attempts
+        self._total_dispatches = total
+        self._paused_until = {task_id: now + max(0.0, remaining - elapsed)
+                              for task_id, remaining in pause.items()}
+        self._last_projection = last
+        self.records = records
+
+    async def _persist_checkpoint(self) -> None:
+        if self.checkpoint is None:
+            return
+        async with self._checkpoint_lock:
+            await _await(self.checkpoint(self.snapshot()))
 
     def priority(self, task: Challenge) -> float:
         if not _feasible(task):
@@ -190,7 +286,7 @@ class ContestScheduler:
         closing: Callable[[], bool] = lambda: False,
     ) -> list[DispatchRecord]:
         idle_cycles = 0
-        cycle = 0
+        cycle = self._cycle
         while cycle < self.policy.max_cycles:
             if closing():
                 break
@@ -230,6 +326,8 @@ class ContestScheduler:
                 await asyncio.sleep(sleep_s)
                 if not self.policy.wait_until_closing and not waiting_for_retry:
                     cycle += 1
+                    self._cycle = cycle
+                    await self._persist_checkpoint()
                 continue
             idle_cycles = 0
             # Give each task one exploration pass before revisiting a task
@@ -243,6 +341,8 @@ class ContestScheduler:
             batch = eligible[: self.policy.max_tasks]
             await asyncio.gather(*(self._dispatch(task, cycle, work, closing) for task in batch))
             cycle += 1
+            self._cycle = cycle
+            await self._persist_checkpoint()
         return list(self.records)
 
     def _eligible(self, task: Challenge) -> bool:
@@ -264,9 +364,10 @@ class ContestScheduler:
             return
         projection = _projection(task)
         key = (task.task_id, projection)
+        priority = self.priority(task)
         self._attempts[key] = self._attempts.get(key, 0) + 1
         self._total_dispatches[task.task_id] = self._total_dispatches.get(task.task_id, 0) + 1
-        priority = self.priority(task)
+        self._inflight[task.task_id] = projection
         try:
             if _requires_instance(task):
                 async with self.instances.reserve():
@@ -285,6 +386,17 @@ class ContestScheduler:
             if not outcome.revisit:
                 self._attempts[key] = self.policy.max_revisits_per_projection + 1
             result = "worked"
+        except asyncio.CancelledError:
+            # A stopped quantum has no completed scheduling outcome. Platform
+            # side effects are reconciled separately by the runtime and ledger.
+            self._attempts[key] -= 1
+            if self._attempts[key] == 0:
+                del self._attempts[key]
+            self._total_dispatches[task.task_id] -= 1
+            if self._total_dispatches[task.task_id] == 0:
+                del self._total_dispatches[task.task_id]
+            del self._inflight[task.task_id]
+            raise
         except Exception as exc:
             result = f"error:{type(exc).__name__}"
             if _retryable_worker_error(exc):
@@ -297,6 +409,55 @@ class ContestScheduler:
         self._last_projection[task.task_id] = projection
         self.records.append(DispatchRecord(task.task_id, task.instance_epoch, cycle, priority,
                                            result, prior is not None and prior != projection))
+        del self._inflight[task.task_id]
+        await self._persist_checkpoint()
+
+
+def _json_projection(projection: tuple[Any, ...]) -> list[Any]:
+    # Projection fields come from platform state; reject values a JSON
+    # checkpoint could silently alter before they become retry keys.
+    return json.loads(json.dumps(projection, allow_nan=False))
+
+
+def _restore_projection(value: Any) -> tuple[Any, ...]:
+    if not isinstance(value, list):
+        raise ValueError("invalid projection")
+
+    def freeze(item: Any) -> Any:
+        if isinstance(item, list):
+            return tuple(freeze(child) for child in item)
+        if item is None or isinstance(item, (str, bool, int, float)):
+            if isinstance(item, float) and not math.isfinite(item):
+                raise ValueError("invalid projection value")
+            return item
+        raise ValueError("invalid projection value")
+    return tuple(freeze(item) for item in value)
+
+
+def _finite_number(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("invalid number")
+    if value < 0:
+        raise ValueError("negative number")
+    return float(value)
+
+
+def _nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("invalid count")
+    return value
+
+
+def _number_map(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValueError("invalid map")
+    return {key: _finite_number(number) for key, number in value.items()}
+
+
+def _int_map(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValueError("invalid map")
+    return {key: _nonnegative_int(number) for key, number in value.items()}
 
 
 def _retryable_worker_error(exc: Exception) -> bool:

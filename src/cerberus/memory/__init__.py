@@ -12,6 +12,7 @@ from .store import (
     MemoryStore,
     ResourceInput,
     ResourceRecord,
+    TaskHistory,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "MemoryStore",
     "ResourceInput",
     "ResourceRecord",
+    "TaskHistory",
 ]

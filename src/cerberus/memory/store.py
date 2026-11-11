@@ -18,11 +18,58 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import Any, BinaryIO, Literal
 
 FactKind = Literal["observation", "hypothesis", "negative_result"]
 FactScope = Literal["task", "instance"]
 VerificationStatus = Literal["unverified", "observed", "verified", "rejected"]
+
+
+def _validate_task_messages(messages: Any) -> list[str]:
+    """Validate a provider transcript, allowing only a final incomplete tool group."""
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("invalid task history messages")
+    pending: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("invalid task history message")
+        role = message.get("role")
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            if not isinstance(call_id, str) or call_id not in pending:
+                raise ValueError("orphan or duplicate task tool result")
+            if not isinstance(message.get("content"), str):
+                raise ValueError("invalid task tool result content")
+            pending.remove(call_id)
+            continue
+        if pending:
+            raise ValueError("incomplete task tool group before next message")
+        if role == "assistant":
+            calls = message.get("tool_calls") or []
+            if not isinstance(calls, list):
+                raise ValueError("invalid task tool calls")
+            for call in calls:
+                if not isinstance(call, dict) or call.get("type") != "function":
+                    raise ValueError("invalid task tool call")
+                call_id = call.get("id")
+                function = call.get("function")
+                if (not isinstance(call_id, str) or not call_id or call_id in pending
+                        or not isinstance(function, dict)
+                        or not isinstance(function.get("name"), str)
+                        or not isinstance(function.get("arguments"), str)):
+                    raise ValueError("invalid task tool call")
+                try:
+                    arguments = json.loads(function["arguments"])
+                except ValueError as exc:
+                    raise ValueError("invalid task tool arguments") from exc
+                if not isinstance(arguments, dict):
+                    raise ValueError("invalid task tool arguments")
+                pending.append(call_id)
+        elif role not in ("system", "user"):
+            raise ValueError("invalid task history role")
+        if message.get("content") is not None and not isinstance(message["content"], str):
+            raise ValueError("invalid task history content")
+    return pending
 
 
 @dataclass(frozen=True)
@@ -267,6 +314,16 @@ class IntentRecord:
     completion_event_id: str | None
 
 
+@dataclass(frozen=True)
+class TaskHistory:
+    """A durable, unverified provider transcript for one task in one run."""
+
+    run_id: str
+    task_id: str
+    instance_epoch: int
+    messages: list[dict[str, Any]]
+
+
 class MemoryStore:
     """Single-writer event log and rebuildable fact projection.
 
@@ -379,6 +436,15 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS intents_frontier
                 ON intents(run_id, task_id, instance_epoch, status, priority);
+            CREATE TABLE IF NOT EXISTS task_histories (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                instance_epoch INTEGER NOT NULL,
+                messages_json TEXT NOT NULL,
+                messages_sha256 TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, task_id)
+            );
             """
         )
         # Existing development runs predate fencing. Old claim events are
@@ -389,6 +455,62 @@ class MemoryStore:
                 "ALTER TABLE intents ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0"
             )
             self._connection.execute("UPDATE intents SET fencing_token = attempts")
+        history_columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(task_histories)")}
+        if "messages_sha256" not in history_columns:
+            self._connection.execute("ALTER TABLE task_histories ADD COLUMN messages_sha256 TEXT")
+
+    def save_task_history(
+        self, run_id: str, task_id: str, instance_epoch: int,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Atomically replace a task transcript, including an unfinished tool turn.
+
+        The transcript is protocol state, not evidence or a verified fact. A
+        caller recovering an unfinished tool turn must reconcile its outcome
+        before making another model request or retrying the tool.
+        """
+        if not run_id or not task_id or instance_epoch < 0:
+            raise ValueError("task history requires run, task and nonnegative epoch")
+        _validate_task_messages(messages)
+        encoded = json.dumps(messages, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO task_histories
+                   (run_id, task_id, instance_epoch, messages_json, messages_sha256, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(run_id, task_id) DO UPDATE SET
+                     instance_epoch = excluded.instance_epoch,
+                     messages_json = excluded.messages_json,
+                     messages_sha256 = excluded.messages_sha256,
+                     updated_at = excluded.updated_at""",
+                (run_id, task_id, instance_epoch, encoded, digest, datetime.now(UTC).isoformat()),
+            )
+
+    def load_task_history(self, run_id: str, task_id: str) -> TaskHistory | None:
+        if not run_id or not task_id:
+            raise ValueError("task history requires run and task")
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT run_id, task_id, instance_epoch, messages_json, messages_sha256
+                   FROM task_histories WHERE run_id = ? AND task_id = ?""",
+                (run_id, task_id),
+            ).fetchone()
+        if row is None:
+            return None
+        encoded = row["messages_json"]
+        digest = row["messages_sha256"]
+        if digest is not None and hashlib.sha256(encoded.encode("utf-8")).hexdigest() != digest:
+            raise ValueError("corrupt task history checksum")
+        try:
+            messages = json.loads(encoded)
+            _validate_task_messages(messages)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("corrupt task history transcript") from exc
+        return TaskHistory(
+            run_id=row["run_id"], task_id=row["task_id"],
+            instance_epoch=row["instance_epoch"], messages=messages,
+        )
 
     @staticmethod
     def _validate_fact(fact: FactInput) -> None:

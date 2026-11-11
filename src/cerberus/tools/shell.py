@@ -76,6 +76,14 @@ class ToolExecutor:
                 except ProcessLookupError:
                     pass
                 stdout, stderr = await process.communicate()
+            except asyncio.CancelledError:
+                # A stopped worker must not leave its tool process running.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.communicate()
+                raise
         stdout_ref = self.evidence.put_bytes(stdout)
         stderr_ref = self.evidence.put_bytes(stderr)
         out_text, out_trunc = _bounded_text(stdout, self.output_limit)

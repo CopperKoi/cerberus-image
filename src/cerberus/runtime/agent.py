@@ -192,6 +192,10 @@ class AgentRun:
         self.evidence = EvidenceStore(self.work_dir / "objects")
         self.memory = MemoryStore(self.work_dir / "run.db", self.evidence)
         self.ledger = AnswerLedger(self.work_dir / "answers.db")
+        if config.mode == "tsecbench":
+            bind_run_state = getattr(platform, "bind_run_state", None)
+            if bind_run_state is not None:
+                bind_run_state(self.work_dir / "tsec-instances.json", resume=resume)
         self.tools = ToolExecutor(self.work_dir / "tasks", self.evidence,
                                   output_limit=config.budget.max_output_bytes,
                                   max_processes=config.concurrency.tool_processes)
@@ -265,7 +269,17 @@ class AgentRun:
                     max_total_dispatches_per_task=10 if long_contest else 8,
                     max_idle_cycles=0 if long_contest else 3,
                     idle_poll_s=5.0 if long_contest else 0.5,
-                    wait_until_closing=long_contest))
+                    wait_until_closing=long_contest),
+                    checkpoint=lambda snapshot: _atomic_json(self.work_dir / "scheduler.json", {
+                        "schema_version": 1, "config_hash": self._config_hash,
+                        "state": snapshot,
+                    }))
+                scheduler_checkpoint = self.work_dir / "scheduler.json"
+                if scheduler_checkpoint.is_file():
+                    saved = json.loads(scheduler_checkpoint.read_text(encoding="utf-8"))
+                    if saved.get("schema_version") != 1 or saved.get("config_hash") != self._config_hash:
+                        raise ValueError("scheduler checkpoint does not match original run")
+                    scheduler.restore(saved["state"])
                 limits = getattr(self.platform, "get_run_limits", None)
                 records = await scheduler.run(self.platform.discover_tasks, self._guarded_task,
                     get_limits=limits,
@@ -537,6 +551,23 @@ class AgentRun:
         prompt = self._task_prompt(task)
         previous_history = self._task_histories.get(task.task_id)
         if previous_history is None:
+            saved_history = self.memory.load_task_history(self.run_id, task.task_id)
+            if saved_history is not None:
+                recovered = saved_history.messages
+                pending = self._pending_tool_call_ids(recovered)
+                if pending:
+                    # A crash may occur after a side effect but before its
+                    # tool result is committed. Never replay that call.
+                    recovered = list(recovered)
+                    for call_id in pending:
+                        recovered.append(tool_result_message(call_id, json.dumps({
+                            "status": "interrupted_uncertain",
+                            "instruction": "Prior tool outcome is unknown. Inspect workspace and platform progress before retrying any side effect.",
+                        })))
+                    self._save_history(task.task_id, saved_history.instance_epoch, recovered)
+                previous_history = (saved_history.instance_epoch, recovered)
+                self._task_histories[task.task_id] = previous_history
+        if previous_history is None:
             prompt_ref = self.evidence.put_bytes(prompt.encode("utf-8"))
             self.memory.record_fact(FactInput(
                 run_id=self.run_id, task_id=task.task_id, title="Platform task input", summary=task.title,
@@ -589,7 +620,7 @@ class AgentRun:
             transport_failures = 0
             while True:
                 if not await self.budget.reserve_model(estimate):
-                    self._task_histories[task.task_id] = (task.instance_epoch, messages)
+                    self._save_history(task.task_id, task.instance_epoch, messages)
                     return False
                 if self.hosted:
                     self._export_hosted_result("interrupted")
@@ -616,12 +647,13 @@ class AgentRun:
                         self._export_hosted_result("interrupted")
                 break
             messages.append(turn.message)
+            self._save_history(task.task_id, task.instance_epoch, messages)
             if not turn.tool_calls:
-                self._task_histories[task.task_id] = (task.instance_epoch, messages)
                 break
             for call in turn.tool_calls:
                 outcome, evidence_ref = await self._execute_call(task, call.name, call.arguments, evidence_ref)
                 messages.append(tool_result_message(call.id, outcome))
+                self._save_history(task.task_id, task.instance_epoch, messages)
                 if self.hosted:
                     self._export_hosted_result("interrupted")
             refresh = getattr(self.platform, "refresh_progress", None)
@@ -646,9 +678,26 @@ class AgentRun:
                             {"platform_unlocked_questions": new_questions}, ensure_ascii=False)})
                 if not task.available:
                     break
-            self._task_histories[task.task_id] = (task.instance_epoch, messages)
+            self._save_history(task.task_id, task.instance_epoch, messages)
             continue_work = task.available
         return multi_task and continue_work
+
+    def _save_history(self, task_id: str, instance_epoch: int,
+                      messages: list[dict[str, Any]]) -> None:
+        self.memory.save_task_history(self.run_id, task_id, instance_epoch, messages)
+        self._task_histories[task_id] = (instance_epoch, messages)
+
+    @staticmethod
+    def _pending_tool_call_ids(messages: list[dict[str, Any]]) -> list[str]:
+        pending: list[str] = []
+        for message in messages:
+            if message.get("role") == "assistant":
+                pending = [call["id"] for call in message.get("tool_calls", [])]
+            elif message.get("role") == "tool":
+                call_id = message.get("tool_call_id")
+                if call_id in pending:
+                    pending.remove(call_id)
+        return pending
 
     def _task_prompt(self, task: Challenge) -> str:
         attachment_names = task.attachments
@@ -842,6 +891,11 @@ class AgentRun:
             if self.config.mode in ("ctfy-hosted", "ctfy-competition") and candidate.question_id not in {
                 q.id for q in task.questions if q.status == "open"
             }:
+                continue
+            question = next((q for q in task.questions if q.id == candidate.question_id), None)
+            if (question is not None and question.max_attempts is not None
+                    and question.attempts_used is not None
+                    and question.attempts_used >= question.max_attempts):
                 continue
             if self.budget.remaining_seconds <= 0:
                 return

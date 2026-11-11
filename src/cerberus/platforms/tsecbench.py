@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -58,8 +62,72 @@ class TSecBenchAdapter:
         self.instance_ready_timeout_s = instance_ready_timeout_s
         self._last_instances: dict[str, tuple[str, tuple[str, ...]]] = {}
         self._instance_epochs: dict[str, int] = {}
+        self._missing_instances: set[str] = set()
+        self._state_path: Path | None = None
+        self._new_task_epoch_floor: int | None = None
         self._confirmed_indices: dict[str, set[int]] = {}
         self._submitted_answers: set[tuple[str, str]] = set()
+
+    def bind_run_state(self, path: str | Path, *, resume: bool) -> None:
+        """Keep instance generations distinct across controller processes.
+
+        The list API supplies no stable instance ID. A resumed process cannot
+        prove that an instance stayed live while it was down, so every known
+        generation advances once before the first remote read.
+        """
+        if self._state_path is not None:
+            raise ValueError("TSecBench run state is already bound")
+        state_path = Path(path)
+        if resume and state_path.is_file():
+            try:
+                saved = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ValueError("unreadable TSecBench instance checkpoint") from exc
+            if not isinstance(saved, dict) or saved.get("schema_version") != 1:
+                raise ValueError("invalid TSecBench instance checkpoint")
+            instances = saved.get("instances")
+            if not isinstance(instances, dict):
+                raise ValueError("invalid TSecBench instance checkpoint")
+            floor = saved.get("new_task_epoch_floor")
+            if floor is not None and (type(floor) is not int or floor < 0):
+                raise ValueError("invalid TSecBench instance checkpoint")
+            self._new_task_epoch_floor = max(time.time_ns(), (floor or 0) + 1)
+            for task_id, row in instances.items():
+                if (not isinstance(task_id, str) or not task_id
+                        or not isinstance(row, dict) or type(row.get("epoch")) is not int
+                        or row["epoch"] < 0 or row.get("status") not in
+                        ("stopped", "stop_pending", "pending", "available")
+                        or not isinstance(row.get("addresses"), list)
+                        or any(not isinstance(address, str) for address in row["addresses"])):
+                    raise ValueError("invalid TSecBench instance checkpoint")
+                self._instance_epochs[task_id] = row["epoch"] + 1
+                self._last_instances[task_id] = (row["status"], tuple(row["addresses"]))
+        elif resume:
+            # Runs created before this checkpoint existed may still have old
+            # answers or histories at a small local epoch. Use a fresh high
+            # floor for first observations rather than silently reusing zero.
+            self._new_task_epoch_floor = time.time_ns()
+        self._state_path = state_path
+        self._save_instance_state()
+
+    def _save_instance_state(self) -> None:
+        if self._state_path is None:
+            return
+        instances = {task_id: {"epoch": self._instance_epochs.get(task_id, 0),
+                               "status": status, "addresses": list(addresses)}
+                     for task_id, (status, addresses) in self._last_instances.items()}
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self._state_path.parent,
+                                         prefix=".tsec-instance-", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump({"schema_version": 1, "instances": instances,
+                       "new_task_epoch_floor": self._new_task_epoch_floor}, output, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.replace(temporary, self._state_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     async def close(self) -> None:
         if self._own_client:
@@ -118,6 +186,7 @@ class TSecBenchAdapter:
         if not isinstance(rows, list):
             raise ValueError("TSecBench list response must be an array")
         challenges: list[Challenge] = []
+        seen_tasks: set[str] = set()
         for row in rows:
             if (not isinstance(row, dict) or not isinstance(row.get("unique_code"), str)
                     or not row["unique_code"]):
@@ -139,7 +208,8 @@ class TSecBenchAdapter:
             if status != "available" and addresses:
                 raise ValueError("TSecBench addresses require an available container")
             task_id = row["unique_code"]
-            self._observe_instance(task_id, status, addresses)
+            seen_tasks.add(task_id)
+            self._observe_instance(task_id, status, addresses, persist=False)
             known = self._confirmed_indices.setdefault(task_id, set())
             if completed:
                 known.update(range(count))
@@ -161,18 +231,27 @@ class TSecBenchAdapter:
                 score=float(row["total_score"]) if row.get("total_score") is not None else None,
                 available=not completed,
             ))
+        self._missing_instances.update(self._last_instances.keys() - seen_tasks)
+        self._save_instance_state()
         return challenges
 
-    def _observe_instance(self, task_id: str, status: str, addresses: list[str]) -> None:
+    def _observe_instance(self, task_id: str, status: str, addresses: list[str], *, persist: bool = True) -> None:
         current = (status, tuple(addresses))
         prior = self._last_instances.get(task_id)
+        if prior is None and self._new_task_epoch_floor is not None:
+            self._instance_epochs[task_id] = self._new_task_epoch_floor
         if prior is not None:
-            restarted = prior[0] in ("stopped", "stop_pending") and status in ("pending", "available")
+            restarted = (task_id in self._missing_instances
+                         or (prior[0] in ("stopped", "stop_pending") and status in ("pending", "available"))
+                         or (prior[0] == "available" and status == "pending"))
             changed_address = (prior[0] == status == "available"
                                and prior[1] and current[1] and prior[1] != current[1])
             if restarted or changed_address:
                 self._instance_epochs[task_id] = self._instance_epochs.get(task_id, 0) + 1
+        self._missing_instances.discard(task_id)
         self._last_instances[task_id] = current
+        if persist:
+            self._save_instance_state()
 
     async def refresh_progress(self) -> list[Challenge]:
         return await self.discover_tasks()

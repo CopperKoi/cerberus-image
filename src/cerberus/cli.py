@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import json
 import os
+import re
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import typer
@@ -17,6 +22,110 @@ from cerberus.providers.deepseek import DeepSeekChatClient
 from cerberus.runtime.agent import AgentRun
 
 app = typer.Typer(no_args_is_help=True)
+
+_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
+def _policy_hash(config: RunConfig) -> str:
+    """Match the policy fingerprint in AgentRun's budget checkpoint."""
+    policy = config.model_copy(update={"run_id": None}).model_dump(mode="json")
+    return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
+
+
+@contextmanager
+def _competition_lock(config: RunConfig) -> Iterator[None]:
+    """Keep two controllers from writing one competition run concurrently."""
+    root = Path(config.work_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".active-run.lock").open("a+b") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("competition run is already active in this work directory") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _checkpoint_policy(root: Path, run_id: str) -> str:
+    checkpoint = root / run_id / "budget.json"
+    try:
+        data = json.loads(checkpoint.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"unreadable competition budget checkpoint: {run_id}") from exc
+    if (not isinstance(data, dict) or data.get("schema_version") != 1
+            or not isinstance(data.get("config_hash"), str)):
+        raise ValueError(f"invalid competition budget checkpoint: {run_id}")
+    return data["config_hash"]
+
+
+def _select_competition_run(config: RunConfig) -> bool | None:
+    """Select a prior run, including a crash before the active marker was written.
+
+    Returns True for resume, False for new, None for an already finished run.
+    The caller holds _competition_lock.
+    """
+    root = Path(config.work_dir).resolve()
+    marker = root / ".active-run.json"
+    expected = _policy_hash(config)
+    if marker.exists():
+        try:
+            active = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("unreadable competition active-run marker") from exc
+        run_id = active.get("run_id") if isinstance(active, dict) else None
+        if (not isinstance(run_id, str) or not _RUN_ID_PATTERN.fullmatch(run_id)
+                or active.get("schema_version") != 1 or active.get("config_hash") != expected):
+            raise ValueError("competition active-run marker does not match this configuration")
+        status = active.get("status", "active")
+        if status not in {"active", "finished"}:
+            raise ValueError("invalid competition active-run status")
+        if config.run_id is not None and config.run_id != run_id:
+            raise ValueError("configured run_id conflicts with the active competition run")
+        if _checkpoint_policy(root, run_id) != expected:
+            raise ValueError("competition checkpoint does not match the active run")
+        config.run_id = run_id
+        if status == "finished":
+            return None
+        return True
+
+    checkpoints = [path.name for path in root.iterdir()
+                   if path.is_dir() and (path / "budget.json").is_file()]
+    matching = [run_id for run_id in checkpoints if _checkpoint_policy(root, run_id) == expected]
+    if config.run_id is not None:
+        if config.run_id in matching:
+            return True
+        if (root / config.run_id).exists() or checkpoints:
+            raise ValueError("configured competition run has no matching budget checkpoint")
+        return False
+    if len(matching) > 1:
+        raise ValueError("multiple compatible competition runs; select one with run_id")
+    if matching:
+        config.run_id = matching[0]
+        return True
+    if checkpoints:
+        raise ValueError("existing competition checkpoint does not match this configuration")
+    return False
+
+
+def _write_active_run(config: RunConfig, run_id: str, *, status: str = "active") -> None:
+    if status not in {"active", "finished"}:
+        raise ValueError("invalid active-run status")
+    root = Path(config.work_dir).resolve()
+    marker = root / ".active-run.json"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=root,
+                                     prefix=".active-run-", delete=False) as output:
+        temporary = Path(output.name)
+        json.dump({"schema_version": 1, "run_id": run_id, "status": status,
+                   "config_hash": _policy_hash(config)}, output, sort_keys=True)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    try:
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _configuration(config: Path, mode: str | None, work_dir: Path | None) -> RunConfig:
@@ -151,25 +260,35 @@ def run(config: Path = typer.Option(Path("configs/mock.yaml"), exists=True),
     platform = None
     run_started = False
     try:
-        platform = _platform(selected)
-        if selected.mode == "ctfy-hosted":
-            # Leave a valid rollup on disk before the first model or platform
-            # request. A hosted runner can terminate the process abruptly at
-            # its wall limit, bypassing Python's finally blocks.
-            platform.export_result(stop_reason="interrupted")
-        provider = _provider(selected)
+        lock = _competition_lock(selected) if selected.mode == "ctfy-competition" else nullcontext()
+        with lock:
+            resume_existing = _select_competition_run(selected) if selected.mode == "ctfy-competition" else False
+            if resume_existing is None:
+                typer.echo(json.dumps({"run_id": selected.run_id, "status": "finished"}))
+                return
+            platform = _platform(selected)
+            if selected.mode == "ctfy-hosted":
+                # Leave a valid rollup on disk before the first model or platform
+                # request. A hosted runner can terminate the process abruptly at
+                # its wall limit, bypassing Python's finally blocks.
+                platform.export_result(stop_reason="interrupted")
+            provider = _provider(selected)
 
-        async def execute():
-            nonlocal run_started
-            agent = AgentRun(selected, platform, provider)
-            try:
-                run_started = True
-                return await agent.run()
-            finally:
-                await agent.close()
+            async def execute():
+                nonlocal run_started
+                agent = AgentRun(selected, platform, provider, resume=resume_existing)
+                try:
+                    if selected.mode == "ctfy-competition":
+                        _write_active_run(selected, agent.run_id)
+                    run_started = True
+                    return await agent.run()
+                finally:
+                    await agent.close()
 
-        stats = asyncio.run(execute())
-        typer.echo(json.dumps(stats.__dict__, ensure_ascii=False))
+            stats = asyncio.run(execute())
+            if selected.mode == "ctfy-competition":
+                _write_active_run(selected, stats.run_id, status="finished")
+            typer.echo(json.dumps(stats.__dict__, ensure_ascii=False))
     except Exception as exc:
         if selected.mode == "ctfy-hosted" and not run_started:
             hosted_work = Path(os.environ.get("CTFY_WORK_DIR", selected.work_dir)).resolve()
@@ -188,18 +307,28 @@ def resume(config: Path = typer.Option(Path("configs/mock.yaml"), exists=True),
     selected.run_id = run_id
     if selected.mode != "mock" and selected.provider.kind == "mock":
         raise ValueError("mock provider is only allowed in mock mode")
-    platform = _platform(selected)
-    provider = _provider(selected)
+    lock = _competition_lock(selected) if selected.mode == "ctfy-competition" else nullcontext()
+    with lock:
+        if selected.mode == "ctfy-competition":
+            if _select_competition_run(selected) is None:
+                typer.echo(json.dumps({"run_id": selected.run_id, "status": "finished"}))
+                return
+        platform = _platform(selected)
+        provider = _provider(selected)
 
-    async def execute():
-        agent = AgentRun(selected, platform, provider, resume=True)
-        try:
-            return await agent.run()
-        finally:
-            await agent.close()
+        async def execute():
+            agent = AgentRun(selected, platform, provider, resume=True)
+            try:
+                if selected.mode == "ctfy-competition":
+                    _write_active_run(selected, agent.run_id)
+                return await agent.run()
+            finally:
+                await agent.close()
 
-    stats = asyncio.run(execute())
-    typer.echo(json.dumps(stats.__dict__, ensure_ascii=False))
+        stats = asyncio.run(execute())
+        if selected.mode == "ctfy-competition":
+            _write_active_run(selected, stats.run_id, status="finished")
+        typer.echo(json.dumps(stats.__dict__, ensure_ascii=False))
 
 
 eval_app = typer.Typer(no_args_is_help=True)
