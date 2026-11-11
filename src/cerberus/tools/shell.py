@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from cerberus.memory.store import EvidenceRef, EvidenceStore
 
@@ -23,6 +25,8 @@ class ShellResult:
     timed_out: bool
     stdout_truncated: bool
     stderr_truncated: bool
+    stdout_capture_truncated: bool = False
+    stderr_capture_truncated: bool = False
 
 
 def _bounded_text(data: bytes, limit: int) -> tuple[str, bool]:
@@ -31,14 +35,31 @@ def _bounded_text(data: bytes, limit: int) -> tuple[str, bool]:
 
 class ToolExecutor:
     def __init__(self, root: str | Path, evidence: EvidenceStore, *, output_limit: int = 65536,
-                 max_processes: int = 2) -> None:
+                 max_processes: int = 2, capture_limit: int | None = None) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.evidence = evidence
-        if output_limit < 1 or max_processes < 1:
+        if capture_limit is None:
+            capture_limit = max(output_limit, 16 * 1024 * 1024)
+        if output_limit < 1 or max_processes < 1 or capture_limit < output_limit:
             raise ValueError("invalid tool limits")
         self.output_limit = output_limit
+        self.capture_limit = capture_limit
         self._semaphore = asyncio.Semaphore(max_processes)
+
+    async def _capture(self, stream: asyncio.StreamReader, output: BinaryIO) -> bool:
+        """Drain a child pipe while retaining at most capture_limit bytes."""
+        retained = 0
+        truncated = False
+        while chunk := await stream.read(65536):
+            available = self.capture_limit - retained
+            if available > 0:
+                kept = chunk[:available]
+                output.write(kept)
+                retained += len(kept)
+            if len(chunk) > available:
+                truncated = True
+        return truncated
 
     def task_dir(self, task_id: str) -> Path:
         # Task IDs come from a platform; do not interpret them as path segments.
@@ -61,35 +82,82 @@ class ToolExecutor:
         cwd = self.task_dir(task_id)
         started = time.monotonic()
         async with self._semaphore:
-            process = await asyncio.create_subprocess_exec(
-                "/bin/sh", "-c", command, cwd=cwd, env=self._child_env(),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            timed_out = False
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
-            except TimeoutError:
-                timed_out = True
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                process = await asyncio.create_subprocess_exec(
+                    "/bin/sh", "-c", command, cwd=cwd, env=self._child_env(),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
+                assert process.stdout is not None and process.stderr is not None
+                stdout_task = asyncio.create_task(self._capture(process.stdout, stdout_file))
+                stderr_task = asyncio.create_task(self._capture(process.stderr, stderr_file))
+                finished = asyncio.gather(process.wait(), stdout_task, stderr_task)
+                timed_out = False
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                stdout, stderr = await process.communicate()
-            except asyncio.CancelledError:
-                # A stopped worker must not leave its tool process running.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await process.communicate()
-                raise
-        stdout_ref = self.evidence.put_bytes(stdout)
-        stderr_ref = self.evidence.put_bytes(stderr)
-        out_text, out_trunc = _bounded_text(stdout, self.output_limit)
-        err_text, err_trunc = _bounded_text(stderr, self.output_limit)
+                    _, out_capture_trunc, err_capture_trunc = await asyncio.wait_for(
+                        asyncio.shield(finished), timeout=timeout_s
+                    )
+                except TimeoutError:
+                    timed_out = True
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _, out_capture_trunc, err_capture_trunc = await finished
+                except asyncio.CancelledError:
+                    # A stopped worker must not leave its tool process running.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await finished
+                    raise
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout_ref = self.evidence.put_stream(stdout_file)
+                stderr_ref = self.evidence.put_stream(stderr_file)
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                out_text, out_trunc = _bounded_text(stdout_file.read(self.output_limit + 1), self.output_limit)
+                err_text, err_trunc = _bounded_text(stderr_file.read(self.output_limit + 1), self.output_limit)
         return ShellResult(process.returncode, out_text, err_text, stdout_ref, stderr_ref,
-                           time.monotonic() - started, timed_out, out_trunc, err_trunc)
+                           time.monotonic() - started, timed_out,
+                           out_trunc or out_capture_trunc, err_trunc or err_capture_trunc,
+                           out_capture_trunc, err_capture_trunc)
+
+    def stage_attachment(self, task_id: str, name: str, source: str | Path,
+                         *, max_bytes: int = 100_000_000) -> EvidenceRef:
+        """Copy a platform attachment into one task without trusting its filename."""
+        if (not name or Path(name).name != name or name in {".", ".."}
+                or "\\" in name or max_bytes < 1):
+            raise ValueError("attachment name must be a simple filename")
+        destination = self.task_dir(task_id) / name
+        source_path = Path(source)
+        if source_path.resolve() == destination.resolve() and not destination.is_symlink():
+            if destination.stat().st_size > max_bytes:
+                raise ValueError("attachment exceeds size limit")
+        else:
+            temporary: Path | None = None
+            try:
+                with source_path.open("rb") as input_file, tempfile.NamedTemporaryFile(
+                    dir=destination.parent, prefix=".attachment-", delete=False
+                ) as output_file:
+                    temporary = Path(output_file.name)
+                    size = 0
+                    while chunk := input_file.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise ValueError("attachment exceeds size limit")
+                        output_file.write(chunk)
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
+                os.replace(temporary, destination)
+                temporary = None
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        with destination.open("rb") as staged:
+            return self.evidence.put_stream(staged)
 
     def read_file(self, task_id: str, relative_path: str, *, offset: int = 0, limit: int = 65536) -> bytes:
         if offset < 0 or limit < 1 or limit > self.output_limit:

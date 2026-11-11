@@ -54,6 +54,11 @@ TOOLS: list[dict[str, Any]] = [
       "parameters": {"type": "object", "properties": {"sha256": {"type": "string"},
                      "offset": {"type": "integer"}, "limit": {"type": "integer"}},
                      "required": ["sha256"]}}},
+    {"type": "function", "function": {"name": "search_evidence", "description": "Find exact UTF-8 text in an evidence object referenced by this task's current facts. Returns byte offsets and short context snippets.",
+      "parameters": {"type": "object", "properties": {"sha256": {"type": "string"},
+                     "query": {"type": "string"}, "max_matches": {"type": "integer"},
+                     "context_bytes": {"type": "integer"}},
+                     "required": ["sha256", "query"]}}},
     {"type": "function", "function": {"name": "write_file", "description": "Write a UTF-8 file relative to this task's working directory.",
       "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                      "required": ["path", "content"]}}},
@@ -585,10 +590,7 @@ class AgentRun:
             for attachment_name in attachment_names:
                 try:
                     source = await _maybe_await(fetch_attachment(attachment_name))
-                    destination = self.tools.task_dir(task.task_id) / attachment_name
-                    if Path(source).resolve() != destination.resolve():
-                        import shutil
-                        shutil.copyfile(source, destination)
+                    self.tools.stage_attachment(task.task_id, attachment_name, source)
                 except Exception as exc:
                     self.stats.errors.append(f"{task.task_id}: attachment {attachment_name} {type(exc).__name__}")
         initial_messages: list[dict[str, Any]] = [
@@ -759,7 +761,9 @@ class AgentRun:
                     "stderr": result.stderr, "stdout_ref": result.stdout_ref.sha256,
                     "stderr_ref": result.stderr_ref.sha256, "timed_out": result.timed_out,
                     "stdout_truncated": result.stdout_truncated,
-                    "stderr_truncated": result.stderr_truncated}), result.stdout_ref.sha256
+                    "stderr_truncated": result.stderr_truncated,
+                    "stdout_capture_truncated": result.stdout_capture_truncated,
+                    "stderr_capture_truncated": result.stderr_capture_truncated}), result.stdout_ref.sha256
             if name == "read_file":
                 content = self.tools.read_file(task.task_id, str(args["path"]),
                                                offset=int(args.get("offset", 0)))
@@ -773,19 +777,36 @@ class AgentRun:
                 ))
                 return json.dumps({"content": content.decode("utf-8", errors="replace"),
                                    "evidence_ref": ref.sha256}), ref.sha256
-            if name == "read_evidence":
+            if name in ("read_evidence", "search_evidence"):
                 digest = args.get("sha256")
-                offset = args.get("offset", 0)
-                limit = args.get("limit", 8192)
                 if (not isinstance(digest, str) or len(digest) != 64
-                        or any(char not in "0123456789abcdef" for char in digest)
-                        or type(offset) is not int or offset < 0
-                        or type(limit) is not int or not 1 <= limit <= 8192):
-                    return json.dumps({"error": "invalid evidence page"}), last_evidence
+                        or any(char not in "0123456789abcdef" for char in digest)):
+                    return json.dumps({"error": "invalid evidence page" if name == "read_evidence"
+                                       else "invalid evidence search"}), last_evidence
+                if name == "search_evidence":
+                    query = args.get("query")
+                    max_matches = args.get("max_matches", 10)
+                    context_bytes = args.get("context_bytes", 80)
+                    if (not isinstance(query, str) or not query or len(query.encode("utf-8")) > 256
+                            or type(max_matches) is not int or not 1 <= max_matches <= 20
+                            or type(context_bytes) is not int or not 0 <= context_bytes <= 256):
+                        return json.dumps({"error": "invalid evidence search"}), last_evidence
+                else:
+                    offset = args.get("offset", 0)
+                    limit = args.get("limit", 8192)
+                    if (type(offset) is not int or offset < 0
+                            or type(limit) is not int or not 1 <= limit <= 8192):
+                        return json.dumps({"error": "invalid evidence page"}), last_evidence
                 fact = next((item for item in self.memory.current_facts(
                     self.run_id, task.task_id, task.instance_epoch) if item.evidence.sha256 == digest), None)
                 if fact is None:
                     return json.dumps({"error": "evidence is not in this task's current scope"}), last_evidence
+                if name == "search_evidence":
+                    matches = self.evidence.search_text(
+                        fact.evidence, query, max_matches=max_matches, context_bytes=context_bytes)
+                    return json.dumps({"sha256": digest, "matches": [
+                        {"byte_offset": match.byte_offset, "snippet": match.snippet}
+                        for match in matches]}, ensure_ascii=False), digest
                 content, next_offset, size = self.evidence.read_page(fact.evidence, offset, limit)
                 try:
                     readable = {"content_utf8": content.decode("utf-8")}
