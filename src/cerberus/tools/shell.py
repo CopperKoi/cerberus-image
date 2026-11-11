@@ -61,6 +61,31 @@ class ToolExecutor:
                 truncated = True
         return truncated
 
+    @staticmethod
+    async def _stop_process(process: asyncio.subprocess.Process) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+        except TimeoutError:
+            process.kill()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            except TimeoutError:
+                pass
+
+    @staticmethod
+    def _close_pipes(process: asyncio.subprocess.Process) -> None:
+        transport = getattr(process, "_transport", None)
+        if transport is None:
+            return
+        for fd in (1, 2):
+            pipe = transport.get_pipe_transport(fd)
+            if pipe is not None:
+                pipe.close()
+
     def task_dir(self, task_id: str) -> Path:
         # Task IDs come from a platform; do not interpret them as path segments.
         import hashlib
@@ -99,18 +124,20 @@ class ToolExecutor:
                     )
                 except TimeoutError:
                     timed_out = True
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    _, out_capture_trunc, err_capture_trunc = await finished
+                    await self._stop_process(process)
+                    stdout_task.cancel()
+                    stderr_task.cancel()
+                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                    self._close_pipes(process)
+                    await asyncio.gather(finished, return_exceptions=True)
+                    out_capture_trunc = err_capture_trunc = True
                 except asyncio.CancelledError:
-                    # A stopped worker must not leave its tool process running.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    await finished
+                    await self._stop_process(process)
+                    stdout_task.cancel()
+                    stderr_task.cancel()
+                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                    self._close_pipes(process)
+                    await asyncio.gather(finished, return_exceptions=True)
                     raise
                 stdout_file.seek(0)
                 stderr_file.seek(0)
