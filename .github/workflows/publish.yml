@@ -23,5 +23,5 @@ jobs:
           file: docker/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/copperkoi/cerberus-image:recovery-continuity-20261111-r12
+          tags: ghcr.io/copperkoi/cerberus-image:recovery-continuity-20261111-r13
           labels: org.opencontainers.image.source=https://github.com/CopperKoi/cerberus-image
